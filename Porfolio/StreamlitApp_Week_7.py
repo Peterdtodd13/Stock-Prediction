@@ -58,9 +58,9 @@ df_features = extract_features()
 MODEL_INFO = {
         "endpoint": aws_endpoint,
         "explainer": 'explainer.shap',
-        "pipeline": 'finalized_model.tar.gz',
-        "keys": ["GOOGL", "IBM", "DEXJPUS", "DEXUSUK", "SP500", "DJIA", "VIXCLS"],
-        "inputs": [{"name": k, "type": "number", "min": -1.0, "max": 1.0, "default": 0.0, "step": 0.01} for k in ["GOOGL", "IBM", "DEXJPUS", "DEXUSUK", "SP500", "DJIA", "VIXCLS"]]
+        "pipeline": 'finalized_pair_model.tar.gz',
+        "keys": ["MPWR", "AAPL"],
+        "inputs": [{"name": k, "type": "number", "min": 0.0, "default": 0.0, "step": 10} for k in ["MPWR", "AAPL"]]
 }
 
 def load_pipeline(_session, bucket, key):
@@ -68,8 +68,8 @@ def load_pipeline(_session, bucket, key):
     filename=MODEL_INFO["pipeline"]
 
     s3_client.download_file(
-        Filename=filename, 
-        Bucket=bucket, 
+        Filename=filename,
+        Bucket=bucket,
         Key= f"{key}/{os.path.basename(filename)}")
         # Extract the .joblib file from the .tar.gz
     with tarfile.open(filename, "r:gz") as tar:
@@ -86,7 +86,7 @@ def load_shap_explainer(_session, bucket, key, local_path):
     # Only download if it doesn't exist locally to save time
     if not os.path.exists(local_path):
         s3_client.download_file(Filename=local_path, Bucket=bucket, Key=key)
-        
+       
     with open(local_path, "rb") as f:
         return shap.Explainer.load(f)
 
@@ -97,7 +97,7 @@ def call_model_api(input_df):
         endpoint_name=MODEL_INFO["endpoint"],
         sagemaker_session=sm_session,
         serializer=NumpySerializer(),
-        deserializer=NumpyDeserializer() 
+        deserializer=NumpyDeserializer()
     )
 
     try:
@@ -111,13 +111,22 @@ def call_model_api(input_df):
 def display_explanation(input_df, session, aws_bucket):
     explainer_name = MODEL_INFO["explainer"]
     explainer = load_shap_explainer(session, aws_bucket, posixpath.join('explainer', explainer_name),os.path.join(tempfile.gettempdir(), explainer_name))
-    shap_values = explainer(input_df)
+
+
+best_pipeline = load_pipeline(session, aws_bucket, 'sklearn-pipeline-deployment')
+preprocessing_pipeline = Pipeline(steps=best_pipeline.steps[:-2])
+input_df_transformed = preprocessing_pipeline.transform(input_df)
+feature_names = best_pipeline[1:4].get_feature_names_out()
+input_df_transformed = pd.DataFrame(X_test_transformed, columns=feature_names)
+shap_values = explainer(X_test_transformed)
+
     st.subheader("🔍 Decision Transparency (SHAP)")
     fig, ax = plt.subplots(figsize=(10, 4))
-    shap.plots.waterfall(shap_values[0], max_display=10)
+    shap.plots.waterfall(shap_values[0, :, 0])
     st.pyplot(fig)
-    # top feature   
-    top_feature = shap_values[0].feature_names[0]
+    # top feature  
+  top_feature = pd.Series(shap_values[0, : 0].values, index=shap_values[0, :, 0].feature_names).abs().idmax()
+    #top_feature = shap_values[0].feature_names[0]
     st.info(f"**Business Insight:** The most influential factor in this decision was **{top_feature}**.")
 
 # Streamlit UI
@@ -128,14 +137,14 @@ with st.form("pred_form"):
     st.subheader(f"Inputs")
     cols = st.columns(2)
     user_inputs = {}
-    
+   
     for i, inp in enumerate(MODEL_INFO["inputs"]):
         with cols[i % 2]:
             user_inputs[inp['name']] = st.number_input(
                 inp['name'].replace('_', ' ').upper(),
-                min_value=inp['min'], max_value=inp['max'], value=inp['default'], step=inp['step']
+                min_value=inp['min'], value=inp['default'], step=inp['step']
             )
-    
+   
     submitted = st.form_submit_button("Run Prediction")
 
 if submitted:
@@ -144,13 +153,15 @@ if submitted:
     # Prepare data
     base_df = df_features
     input_df = pd.concat([base_df, pd.DataFrame([data_row], columns=base_df.columns)])
-    
+   
     res, status = call_model_api(input_df)
     if status == 200:
         st.metric("Prediction Result", res)
         display_explanation(input_df,session, aws_bucket)
     else:
         st.error(res)
+
+
 
 
 
