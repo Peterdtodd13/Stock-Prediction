@@ -66,7 +66,7 @@ def input_fn(request_body, request_content_type):
     file_path = os.path.join(model_dir, 'SP500Data.csv')
     dataset = pd.read_csv(file_path,index_col=0)
     #dataset = pd.read_csv(r'./SP500Data.csv',index_col=0)
-    target = 'MSFT'
+    target = 'GOOGL'
 
     option = 2
 
