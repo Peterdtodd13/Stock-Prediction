@@ -7,10 +7,12 @@ import requests
 #from datetime import datetime, timedelta
 import os
 import sys
-import json #
 
-from src.Custom_Classes import FeatureEngineer
+import os
+import sys
 
+
+# ... continue with your script ...
 
 def extract_features():
 
@@ -86,65 +88,41 @@ def get_bitcoin_historical_prices(days = 60):
     df = df[['Date', 'Close Price (USD)']].set_index('Date')
     return df
 
-def convert_input_pca_regression(request_body, request_content_type):
-    print(f"Receiving data of type: {request_content_type}")
+def get_year(col):
+    return pd.to_numeric(col.iloc[:, 0].str[-4:], errors='coerce').to_frame()
+
+def get_emp_num(col):
+    s = col.iloc[:, 0].str.replace('10+ years', '10', regex=False).str.replace('< 1 year', '0', regex=False)
+    return pd.to_numeric(s.str.split().str[0], errors='coerce').to_frame()
+
+def get_term_num(col):
+    return pd.to_numeric(col.iloc[:, 0].str.replace(' months', '', regex=False), errors='coerce').to_frame()
+
+def run_strategy(data_df_ticker):
+    initial_capital = 100000  # Initial capital for trading
+    capital = initial_capital
+    position = 0  # No initial position
+    portfolio_value_current = 0
     
-    current_dir = os.path.dirname(os.path.abspath(__file__))
-    project_root = os.path.abspath(os.path.join(current_dir, '..'))
-    file_path = os.path.join(project_root, 'Porfolio/SP500Data.csv')
-
-    dataset = pd.read_csv(file_path,index_col=0)
-
-    target = 'GOOGL'
-
-    option = 2
-
-    if option == 2:
-
-        X = FeatureEngineer(windows=[5,10,15,20,30]).transform(dataset[[target]])
+    # Track portfolio value over time
+    portfolio_value = []
     
-        techIndicator_1 = 'RSI_15'
-        RSI_15 = json.loads(request_body)[techIndicator_1]
-        techIndicator_2 = 'MOM_15'
-        MOM_15 = json.loads(request_body)[techIndicator_2]
-
-        # Calculate the distance
-        distances = np.sqrt(
-            (X[techIndicator_1] - RSI_15)**2 + 
-            (X[techIndicator_2] - MOM_15)**2
-        )
-        
-        closest_index = distances.idxmin()
-        closest_row = X.loc[[closest_index]]
+    for i in range(1, len(data_df_ticker)):
+        # Buy
+        if data_df_ticker['Buy_Signal'][i] and capital > 0:
+            position = capital / data_df_ticker['Close'][i]
+            capital = 0  # No remaining capital
     
-        closest_row[techIndicator_1] = RSI_15
-        closest_row[techIndicator_2] = MOM_15
+        # Sell
+        elif data_df_ticker['Sell_Signal'][i] and position > 0:
+            capital = position * data_df_ticker['Close'][i]
+            position = 0
     
-        return closest_row
-    else:
-
-        return_period = 5
-
-        SP500_1 = 'IBM_CR_Cum'
-        IBM_CR_Cum = json.loads(request_body)[SP500_1]
-        SP500_2 = 'NVDA_CR_Cum'
-        NVDA_CR_Cum = json.loads(request_body)[SP500_2]
-
-        X = np.log(dataset.drop([target],axis=1)).diff(return_period)
-        X = np.exp(X).cumsum()
-        X.columns = [name + "_CR_Cum" for name in X.columns]
-        
-        # Calculate the distance
-        distances = np.sqrt(
-            (X[SP500_1] - IBM_CR_Cum)**2 + 
-            (X[SP500_2] - NVDA_CR_Cum)**2
-        )
-        
-        closest_index = distances.idxmin()
-        closest_row = X.loc[[closest_index]]
-    
-        closest_row[SP500_1] = IBM_CR_Cum
-        closest_row[SP500_2] = NVDA_CR_Cum
-    
-        return closest_row
-    
+        # Track portfolio value
+        if position == 0:
+            portfolio_value_current = capital
+        elif position > 0:
+            portfolio_value_current =  position * data_df_ticker['Close'][i]
+            
+        portfolio_value.append(portfolio_value_current)
+    return portfolio_value
