@@ -1,302 +1,174 @@
-"""
-Loan Default Prediction — Streamlit Web Application
-Machine Learning in Finance · Milestone 4
-
-Run locally:
-    streamlit run app.py
-
-Requirements: see requirements.txt
-"""
-
-import streamlit as st
+import os, sys, warnings
 import numpy as np
 import pandas as pd
-import joblib
+import streamlit as st
 import matplotlib.pyplot as plt
-import matplotlib
-matplotlib.use("Agg")
-import os, warnings
-warnings.filterwarnings("ignore")
+import posixpath
 
-# ── Page config ───────────────────────────────────────────────────────────────
-st.set_page_config(
-    page_title="Loan Default Predictor",
-    page_icon="🏦",
-    layout="wide",
-    initial_sidebar_state="expanded",
-)
+import joblib
+import tarfile
+import tempfile
 
-# ── Custom CSS ────────────────────────────────────────────────────────────────
-st.markdown("""
-<style>
-    .risk-high   { background:#fee2e2; border-left:6px solid #dc2626;
-                   padding:14px 18px; border-radius:6px; font-size:1.05rem; }
-    .risk-low    { background:#dcfce7; border-left:6px solid #16a34a;
-                   padding:14px 18px; border-radius:6px; font-size:1.05rem; }
-    .metric-box  { background:#f1f5f9; border-radius:8px; padding:12px 16px;
-                   text-align:center; }
-    .section-hdr { font-size:1.15rem; font-weight:700; color:#1e3a5f;
-                   margin-top:1.2rem; margin-bottom:.4rem; }
-</style>
-""", unsafe_allow_html=True)
+import boto3
+import sagemaker
+from sagemaker.predictor import Predictor
+from sagemaker.serializers import JSONSerializer
+from sagemaker.deserializers import NumpyDeserializer
 
-# ── Load artefacts ────────────────────────────────────────────────────────────
-PIPELINE_PATH  = "best_pipeline.pkl"
-EXPLAINER_PATH = "shap_explainer.pkl"
+from sklearn.pipeline import Pipeline
+import shap
 
-@st.cache_resource(show_spinner="Loading model…")
-def load_pipeline():
-    if not os.path.exists(PIPELINE_PATH):
-        return None
-    return joblib.load(PIPELINE_PATH)
+from joblib import dump, load
 
-@st.cache_resource(show_spinner="Loading SHAP explainer…")
-def load_explainer():
-    if not os.path.exists(EXPLAINER_PATH):
-        return None
-    return joblib.load(EXPLAINER_PATH)
+# Setup & Path Configuration
+warnings.simplefilter("ignore")
 
-pipeline  = load_pipeline()
-explainer = load_explainer()
+current_dir  = os.path.dirname(os.path.abspath(__file__))
+project_root = os.path.abspath(os.path.join(current_dir, '..'))
+if project_root not in sys.path:
+    sys.path.append(project_root)
 
-FEATURES = [
-    "int_rate", "dti", "fico_range_low", "revol_util", "annual_inc_log",
-    "loan_amnt_log", "installment", "open_acc", "pub_rec", "delinq_2yrs",
-    "credit_history_years", "income_to_loan_ratio", "installment_to_income",
-    "total_interest_burden", "sub_grade_freq", "emp_stable",
-    "revol_bal_log", "annual_inc",
-]
+file_path = os.path.join(current_dir, 'X_train.csv')
+dataset = pd.read_csv(file_path)
+if 'Unnamed: 0' in dataset.columns:
+    dataset = dataset.drop(['Unnamed: 0'], axis=1)
 
-FEATURE_LABELS = {
-    "int_rate":               "Interest Rate (%)",
-    "dti":                    "Debt-to-Income Ratio (%)",
-    "fico_range_low":         "FICO Score (lower bound)",
-    "revol_util":             "Revolving Credit Utilisation (%)",
-    "annual_inc":             "Annual Income ($)",
-    "installment":            "Monthly Installment ($)",
-    "open_acc":               "Number of Open Accounts",
-    "pub_rec":                "Public Derogatory Records",
-    "delinq_2yrs":            "Delinquencies (past 2 years)",
-    "credit_history_years":   "Credit History Length (years)",
-    "loan_amnt_log":          "Loan Amount (log-transformed) — auto",
-    "annual_inc_log":         "Annual Income (log-transformed) — auto",
-    "income_to_loan_ratio":   "Income-to-Loan Ratio — auto",
-    "installment_to_income":  "Installment-to-Income Ratio — auto",
-    "total_interest_burden":  "Total Interest Burden ($) — auto",
-    "sub_grade_freq":         "Sub-Grade Frequency — auto",
-    "revol_bal_log":          "Revolving Balance (log) — auto",
-    "emp_stable":             "Employed ≥ 5 Years — auto",
+# Access the secrets
+aws_id       = st.secrets["aws_credentials"]["AWS_ACCESS_KEY_ID"]
+aws_secret   = st.secrets["aws_credentials"]["AWS_SECRET_ACCESS_KEY"]
+aws_token    = st.secrets["aws_credentials"]["AWS_SESSION_TOKEN"]
+aws_bucket   = st.secrets["aws_credentials"]["AWS_BUCKET"]
+aws_endpoint = st.secrets["aws_credentials"]["AWS_ENDPOINT"]
+
+# AWS Session Management
+@st.cache_resource
+def get_session(aws_id, aws_secret, aws_token):
+    return boto3.Session(
+        aws_access_key_id=aws_id,
+        aws_secret_access_key=aws_secret,
+        aws_session_token=aws_token,
+        region_name='us-east-1'
+    )
+
+session    = get_session(aws_id, aws_secret, aws_token)
+sm_session = sagemaker.Session(boto_session=session, default_bucket=aws_bucket)
+
+# Data & Model Configuration
+MODEL_INFO = {
+    "endpoint"  : aws_endpoint,
+    "explainer" : "shap_explainer_loan.joblib",
+    "pipeline"  : "finalized_loan_model.tar.gz",
+    "keys"      : ['int_rate', 'fico_range_low', 'dti', 'revol_util'],
+    "inputs"    : [
+        {"name": "int_rate",       "type": "number", "min": 5.0,   "max": 30.0,  "default": 13.5, "step": 0.1},
+        {"name": "fico_range_low", "type": "number", "min": 580.0, "max": 850.0, "default": 700.0,"step": 1.0},
+        {"name": "dti",            "type": "number", "min": 0.0,   "max": 45.0,  "default": 18.0, "step": 0.1},
+        {"name": "revol_util",     "type": "number", "min": 0.0,   "max": 100.0, "default": 45.0, "step": 0.1},
+    ]
 }
 
-# ── Sidebar: applicant inputs ─────────────────────────────────────────────────
-st.sidebar.header("📋 Applicant Information")
 
-st.sidebar.markdown("**Loan Details**")
-loan_amnt = st.sidebar.number_input("Loan Amount ($)",        1_000, 40_000, 12_000, 500)
-int_rate  = st.sidebar.slider("Interest Rate (%)",            5.0,   30.0,   13.5,  0.1)
-installment = st.sidebar.number_input("Monthly Installment ($)", 50, 1_500, 380, 10)
-term_60   = st.sidebar.selectbox("Loan Term", ["36 months", "60 months"])
+def load_pipeline(_session, bucket, key):
+    s3_client = _session.client('s3')
+    filename  = MODEL_INFO["pipeline"]
+    s3_client.download_file(
+        Filename=filename,
+        Bucket=bucket,
+        Key=f"{key}/{os.path.basename(filename)}")
+    with tarfile.open(filename, "r:gz") as tar:
+        tar.extractall(path=".")
+        joblib_file = [f for f in tar.getnames() if f.endswith('.joblib')][0]
+    return joblib.load(f"{joblib_file}")
 
-st.sidebar.markdown("**Borrower Profile**")
-annual_inc   = st.sidebar.number_input("Annual Income ($)",     10_000, 500_000, 65_000, 1_000)
-dti          = st.sidebar.slider("Debt-to-Income Ratio (%)",    0.0,    45.0,   18.0,   0.1)
-fico         = st.sidebar.slider("FICO Score",                  580,    850,    700,    1)
-revol_util   = st.sidebar.slider("Revolving Credit Utilisation (%)", 0.0, 100.0, 45.0, 0.1)
-open_acc     = st.sidebar.number_input("Number of Open Accounts",  1, 40, 10, 1)
-pub_rec      = st.sidebar.number_input("Public Derogatory Records", 0, 10, 0, 1)
-delinq_2yrs  = st.sidebar.number_input("Delinquencies (past 2 yrs)", 0, 15, 0, 1)
-cr_hist_yrs  = st.sidebar.slider("Credit History Length (years)", 0.0, 35.0, 8.0, 0.5)
-revol_bal    = st.sidebar.number_input("Revolving Balance ($)",   0, 200_000, 15_000, 500)
-emp_yrs      = st.sidebar.selectbox("Employment Length", ["< 1 year","1 year","2 years",
-                                     "3 years","4 years","5 years","6 years",
-                                     "7 years","8 years","9 years","10+ years"])
-sub_grade_freq = st.sidebar.slider(
-    "Sub-Grade Frequency (0–1, use 0.05 if unknown)", 0.01, 0.15, 0.05, 0.005)
 
-# ── Derived / engineered features ─────────────────────────────────────────────
-annual_inc_log        = np.log1p(annual_inc)
-loan_amnt_log         = np.log1p(loan_amnt)
-revol_bal_log         = np.log1p(revol_bal)
-income_to_loan_ratio  = min(annual_inc / max(loan_amnt, 1), 100)
-installment_to_income = min(installment / max(annual_inc / 12, 1), 5)
-total_interest_burden = loan_amnt * int_rate / 100
-emp_yrs_num           = 10 if emp_yrs == "10+ years" else (
-                         0 if emp_yrs == "< 1 year" else
-                         int(emp_yrs.split()[0]))
-emp_stable            = float(emp_yrs_num >= 5)
+def load_shap_explainer(_session, bucket, key, local_path):
+    s3_client = _session.client('s3')
+    if not os.path.exists(local_path):
+        s3_client.download_file(Filename=local_path, Bucket=bucket, Key=key)
+    with open(local_path, "rb") as f:
+        return load(f)
 
-input_dict = {
-    "int_rate":               int_rate,
-    "dti":                    dti,
-    "fico_range_low":         fico,
-    "revol_util":             revol_util,
-    "annual_inc_log":         annual_inc_log,
-    "loan_amnt_log":          loan_amnt_log,
-    "installment":            installment,
-    "open_acc":               float(open_acc),
-    "pub_rec":                float(pub_rec),
-    "delinq_2yrs":            float(delinq_2yrs),
-    "credit_history_years":   cr_hist_yrs,
-    "income_to_loan_ratio":   income_to_loan_ratio,
-    "installment_to_income":  installment_to_income,
-    "total_interest_burden":  total_interest_burden,
-    "sub_grade_freq":         sub_grade_freq,
-    "emp_stable":             emp_stable,
-    "revol_bal_log":          revol_bal_log,
-    "annual_inc":             float(annual_inc),
-}
 
-X_input = pd.DataFrame([input_dict])[FEATURES]
+# Prediction Logic
+def call_model_api(input_df):
+    predictor = Predictor(
+        endpoint_name     = MODEL_INFO["endpoint"],
+        sagemaker_session = sm_session,
+        serializer        = JSONSerializer(),
+        deserializer      = NumpyDeserializer()
+    )
+    try:
+        raw_pred = predictor.predict(input_df)
+        pred_val = pd.DataFrame(raw_pred).values[-1][0]
+        mapping  = {0: "Fully Paid", 1: "Charged Off"}
+        return mapping.get(int(pred_val)), 200
+    except Exception as e:
+        return f"Error: {str(e)}", 500
 
-# ── Main page ─────────────────────────────────────────────────────────────────
+
+# Local Explainability
+def display_explanation(input_df, session, aws_bucket):
+    explainer_name = MODEL_INFO["explainer"]
+    explainer = load_shap_explainer(
+        session, aws_bucket,
+        posixpath.join('explainer', explainer_name),
+        os.path.join(tempfile.gettempdir(), explainer_name)
+    )
+
+    best_pipeline         = load_pipeline(session, aws_bucket, 'sklearn-pipeline-deployment')
+    preprocessing_pipeline = Pipeline(steps=best_pipeline.steps[:-1])
+    input_df              = pd.DataFrame(input_df)
+    input_df_transformed  = preprocessing_pipeline.transform(input_df)
+
+    dataset_1     = dataset.iloc[:, 0:]
+    feature_names = dataset_1.columns
+    input_df_transformed = pd.DataFrame(input_df_transformed, columns=feature_names)
+
+    shap_values = explainer(input_df_transformed)
+
+    st.subheader("🔍 Decision Transparency (SHAP)")
+    fig, ax = plt.subplots(figsize=(10, 4))
+    shap.plots.waterfall(shap_values[0])
+    st.pyplot(fig)
+
+    top_feature = pd.Series(
+        shap_values[0].values, index=shap_values[0].feature_names
+    ).abs().idxmax()
+    st.info(f"**Business Insight:** The most influential factor in this decision was **{top_feature}**.")
+
+
+# Streamlit UI
+st.set_page_config(page_title="Loan Default Predictor", page_icon="🏦", layout="wide")
 st.title("🏦 Loan Default Prediction")
-st.caption("Machine Learning in Finance — Milestone 4 | XGBoost Model")
 
-if pipeline is None:
-    st.error(
-        "⚠️ **Model file not found.** "
-        "Please run the Milestone 4 notebook first to generate `best_pipeline.pkl`."
-    )
-    st.info(
-        "**Expected files in the same directory as app.py:**\n"
-        "- `best_pipeline.pkl` (generated in Section 3.6 of the notebook)\n"
-        "- `shap_explainer.pkl` (generated in Section 6.5 of the notebook)"
-    )
-    st.stop()
+with st.form("pred_form"):
+    st.subheader("Applicant Inputs")
+    cols = st.columns(2)
+    user_inputs = {}
 
-col1, col2 = st.columns([1.1, 1.9])
-
-# ── Left column: prediction result ───────────────────────────────────────────
-with col1:
-    st.markdown('<div class="section-hdr">📊 Risk Assessment</div>',
-                unsafe_allow_html=True)
-
-    prob  = pipeline.predict_proba(X_input)[0, 1]
-    label = pipeline.predict(X_input)[0]
-
-    # Optimal threshold from notebook (≈ 0.35)
-    THRESHOLD = 0.35
-    high_risk = prob >= THRESHOLD
-
-    if high_risk:
-        st.markdown(
-            f'<div class="risk-high">⚠️ <b>High Risk — Likely Default</b><br>'
-            f'Predicted default probability: <b>{prob:.1%}</b></div>',
-            unsafe_allow_html=True)
-    else:
-        st.markdown(
-            f'<div class="risk-low">✅ <b>Low Risk — Likely to Repay</b><br>'
-            f'Predicted default probability: <b>{prob:.1%}</b></div>',
-            unsafe_allow_html=True)
-
-    st.markdown("---")
-
-    # Probability gauge bar
-    fig_gauge, ax_g = plt.subplots(figsize=(4.5, 0.9))
-    ax_g.barh([0], [1], color="#e5e7eb", height=0.5)
-    bar_color = "#dc2626" if high_risk else "#16a34a"
-    ax_g.barh([0], [prob], color=bar_color, height=0.5)
-    ax_g.axvline(THRESHOLD, color="#1e3a5f", lw=1.5, ls="--", label=f"Threshold ({THRESHOLD:.0%})")
-    ax_g.set_xlim(0, 1)
-    ax_g.set_yticks([])
-    ax_g.set_xlabel("Default Probability")
-    ax_g.xaxis.set_major_formatter(matplotlib.ticker.PercentFormatter(xmax=1))
-    ax_g.legend(fontsize=7, loc="upper right")
-    ax_g.set_title("Risk Score", fontsize=10, fontweight="bold")
-    fig_gauge.tight_layout()
-    st.pyplot(fig_gauge, use_container_width=True)
-    plt.close(fig_gauge)
-
-    st.markdown("---")
-    st.markdown('<div class="section-hdr">📋 Input Summary</div>',
-                unsafe_allow_html=True)
-    summary = pd.DataFrame({
-        "Feature": ["Loan Amount", "Interest Rate", "FICO Score",
-                    "DTI Ratio", "Annual Income", "Revolving Util.",
-                    "Credit History", "Delinquencies"],
-        "Value": [f"${loan_amnt:,.0f}", f"{int_rate:.1f}%", f"{fico}",
-                  f"{dti:.1f}%", f"${annual_inc:,.0f}", f"{revol_util:.1f}%",
-                  f"{cr_hist_yrs:.1f} yrs", f"{delinq_2yrs}"],
-    })
-    st.dataframe(summary, hide_index=True, use_container_width=True)
-
-# ── Right column: SHAP explanation ───────────────────────────────────────────
-with col2:
-    st.markdown('<div class="section-hdr">🔍 Prediction Explanation (SHAP)</div>',
-                unsafe_allow_html=True)
-
-    if explainer is None:
-        st.warning(
-            "SHAP explainer not found. Run Section 6.5 of the notebook to generate "
-            "`shap_explainer.pkl`, then restart the app."
-        )
-    else:
-        try:
-            import shap
-            shap_vals = explainer.shap_values(X_input)
-
-            # Waterfall plot
-            fig_wf, ax_wf = plt.subplots(figsize=(8, 5))
-
-            feat_vals  = X_input.iloc[0].values
-            sv         = shap_vals[0]
-            base_value = explainer.expected_value
-
-            # Build waterfall data
-            order      = np.argsort(np.abs(sv))[::-1][:10]
-            feats_top  = [FEATURES[i] for i in order]
-            sv_top     = sv[order]
-            fv_top     = feat_vals[order]
-
-            colors = ["#dc2626" if v > 0 else "#16a34a" for v in sv_top]
-            labels = [f"{f}\n= {fv:.2f}" for f, fv in zip(feats_top, fv_top)]
-
-            bars = ax_wf.barh(labels[::-1], sv_top[::-1],
-                              color=colors[::-1], edgecolor="white", height=0.65)
-            ax_wf.axvline(0, color="black", lw=0.8)
-            for bar, val in zip(bars, sv_top[::-1]):
-                ax_wf.text(
-                    val + (0.001 if val >= 0 else -0.001),
-                    bar.get_y() + bar.get_height() / 2,
-                    f"{val:+.4f}", va="center",
-                    ha="left" if val >= 0 else "right", fontsize=8
-                )
-            ax_wf.set_xlabel("SHAP Value (impact on default probability)")
-            ax_wf.set_title(
-                f"Top 10 Feature Contributions\n"
-                f"Base rate: {base_value:.3f}  →  Predicted: {prob:.3f}",
-                fontsize=11, fontweight="bold"
+    for i, inp in enumerate(MODEL_INFO["inputs"]):
+        with cols[i % 2]:
+            user_inputs[inp['name']] = st.number_input(
+                inp['name'].replace('_', ' ').upper(),
+                min_value=float(inp['min']),
+                max_value=float(inp['max']),
+                value=float(inp['default']),
+                step=float(inp['step'])
             )
-            from matplotlib.patches import Patch
-            ax_wf.legend(
-                handles=[Patch(color="#dc2626", label="Increases risk"),
-                         Patch(color="#16a34a", label="Decreases risk")],
-                loc="lower right", fontsize=8
-            )
-            fig_wf.tight_layout()
-            st.pyplot(fig_wf, use_container_width=True)
-            plt.close(fig_wf)
 
-            st.markdown("---")
-            # Feature contribution table
-            st.markdown("**Feature-Level SHAP Contributions**")
-            shap_df = pd.DataFrame({
-                "Feature":    [FEATURES[i] for i in np.argsort(np.abs(sv))[::-1]],
-                "Value":      [f"{feat_vals[i]:.4f}"  for i in np.argsort(np.abs(sv))[::-1]],
-                "SHAP Impact":[f"{sv[i]:+.4f}" for i in np.argsort(np.abs(sv))[::-1]],
-                "Direction":  ["↑ Risk" if sv[i] > 0 else "↓ Risk"
-                               for i in np.argsort(np.abs(sv))[::-1]],
-            }).head(12)
-            st.dataframe(shap_df, hide_index=True, use_container_width=True)
+    submitted = st.form_submit_button("Run Prediction")
 
-        except Exception as e:
-            st.error(f"SHAP plot error: {e}")
+original = dataset.iloc[0:1].to_dict()
+original.update(user_inputs)
 
-# ── Footer ────────────────────────────────────────────────────────────────────
-st.markdown("---")
-st.caption(
-    "Model: XGBoost (tuned via GridSearchCV) | "
-    "Dataset: LendingClub 2007–2018 | "
-    "Imbalance handling: scale_pos_weight | "
-    f"Decision threshold: {THRESHOLD:.0%} (F1-optimal)"
-)
+if submitted:
+    res, status = call_model_api(original)
+    if status == 200:
+        if res == "Charged Off":
+            st.error(f"⚠️ Prediction: **{res}** — High Risk of Default")
+        else:
+            st.success(f"✅ Prediction: **{res}** — Low Risk")
+        st.metric("Prediction Result", res)
+        display_explanation(original, session, aws_bucket)
+    else:
+        st.error(res)
