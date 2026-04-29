@@ -3,24 +3,10 @@ import numpy as np
 import pandas as pd
 import streamlit as st
 import matplotlib.pyplot as plt
-import posixpath
-
 import joblib
-import tarfile
-import tempfile
-
-import boto3
-import sagemaker
-from sagemaker.predictor import Predictor
-from sagemaker.serializers import JSONSerializer
-from sagemaker.deserializers import NumpyDeserializer
-
-from sklearn.pipeline import Pipeline
 import shap
+from sklearn.pipeline import Pipeline
 
-from joblib import dump, load
-
-# Setup & Path Configuration
 warnings.simplefilter("ignore")
 
 current_dir  = os.path.dirname(os.path.abspath(__file__))
@@ -28,118 +14,81 @@ project_root = os.path.abspath(os.path.join(current_dir, '..'))
 if project_root not in sys.path:
     sys.path.append(project_root)
 
+# Load X_train baseline
 file_path = os.path.join(current_dir, 'X_train.csv')
 dataset = pd.read_csv(file_path)
 if 'Unnamed: 0' in dataset.columns:
     dataset = dataset.drop(['Unnamed: 0'], axis=1)
 
-# Access the secrets
-aws_id       = st.secrets["aws_credentials"]["AWS_ACCESS_KEY_ID"]
-aws_secret   = st.secrets["aws_credentials"]["AWS_SECRET_ACCESS_KEY"]
-aws_token    = st.secrets["aws_credentials"]["AWS_SESSION_TOKEN"]
-aws_bucket   = st.secrets["aws_credentials"]["AWS_BUCKET"]
-aws_endpoint = st.secrets["aws_credentials"]["AWS_ENDPOINT"]
-
-# AWS Session Management
+# Load model and explainer from local joblib files
 @st.cache_resource
-def get_session(aws_id, aws_secret, aws_token):
-    return boto3.Session(
-        aws_access_key_id=aws_id,
-        aws_secret_access_key=aws_secret,
-        aws_session_token=aws_token,
-        region_name='us-east-1'
-    )
+def load_model():
+    path = os.path.join(current_dir, 'finalized_loan_model.joblib')
+    return joblib.load(path)
 
-session    = get_session(aws_id, aws_secret, aws_token)
-sm_session = sagemaker.Session(boto_session=session, default_bucket=aws_bucket)
+@st.cache_resource
+def load_explainer():
+    path = os.path.join(current_dir, 'shap_explainer_loan.joblib')
+    return joblib.load(path)
 
-# Data & Model Configuration
+model     = load_model()
+explainer = load_explainer()
+
+# Model Configuration
 MODEL_INFO = {
-    "endpoint"  : aws_endpoint,
-    "explainer" : "shap_explainer_loan.joblib",
-    "pipeline"  : "finalized_loan_model.tar.gz",
-    "keys"      : ['int_rate', 'fico_range_low', 'dti', 'revol_util'],
-    "inputs"    : [
-        {"name": "int_rate",       "type": "number", "min": 5.0,   "max": 30.0,  "default": 13.5, "step": 0.1},
-        {"name": "fico_range_low", "type": "number", "min": 580.0, "max": 850.0, "default": 700.0,"step": 1.0},
-        {"name": "dti",            "type": "number", "min": 0.0,   "max": 45.0,  "default": 18.0, "step": 0.1},
-        {"name": "revol_util",     "type": "number", "min": 0.0,   "max": 100.0, "default": 45.0, "step": 0.1},
+    "keys": ['int_rate', 'fico_range_low', 'dti', 'revol_util'],
+    "inputs": [
+        {"name": "int_rate",       "label": "Interest Rate (%)",         "min": 5.0,   "max": 30.0,  "default": 13.5, "step": 0.1},
+        {"name": "fico_range_low", "label": "FICO Score",                "min": 580.0, "max": 850.0, "default": 700.0,"step": 1.0},
+        {"name": "dti",            "label": "Debt-to-Income Ratio (%)",  "min": 0.0,   "max": 45.0,  "default": 18.0, "step": 0.1},
+        {"name": "revol_util",     "label": "Revolving Utilisation (%)", "min": 0.0,   "max": 100.0, "default": 45.0, "step": 0.1},
     ]
 }
 
-
-def load_pipeline(_session, bucket, key):
-    s3_client = _session.client('s3')
-    filename  = MODEL_INFO["pipeline"]
-    s3_client.download_file(
-        Filename=filename,
-        Bucket=bucket,
-        Key=f"{key}/{os.path.basename(filename)}")
-    with tarfile.open(filename, "r:gz") as tar:
-        tar.extractall(path=".")
-        joblib_file = [f for f in tar.getnames() if f.endswith('.joblib')][0]
-    return joblib.load(f"{joblib_file}")
-
-
-def load_shap_explainer(_session, bucket, key, local_path):
-    s3_client = _session.client('s3')
-    if not os.path.exists(local_path):
-        s3_client.download_file(Filename=local_path, Bucket=bucket, Key=key)
-    with open(local_path, "rb") as f:
-        return load(f)
-
-
-# Prediction Logic
-def call_model_api(input_df):
-    predictor = Predictor(
-        endpoint_name     = MODEL_INFO["endpoint"],
-        sagemaker_session = sm_session,
-        serializer        = JSONSerializer(),
-        deserializer      = NumpyDeserializer()
-    )
+# Prediction
+def call_model(input_df):
     try:
-        raw_pred = predictor.predict(input_df)
-        pred_val = pd.DataFrame(raw_pred).values[-1][0]
-        mapping  = {0: "Fully Paid", 1: "Charged Off"}
-        return mapping.get(int(pred_val)), 200
+        pred_val = model.predict(input_df)[0]
+        mapping  = {0: "Fully Paid (Low Risk)", 1: "Charged Off (High Risk)"}
+        return mapping.get(int(pred_val), str(pred_val)), 200
     except Exception as e:
         return f"Error: {str(e)}", 500
 
+# SHAP Explanation
+def display_explanation(input_df):
+    preprocessing = Pipeline(steps=model.steps[:-1])
+    input_transformed = preprocessing.transform(input_df)
+    feature_names = dataset.columns.tolist()
+    input_transformed = pd.DataFrame(input_transformed, columns=feature_names)
 
-# Local Explainability
-def display_explanation(input_df, session, aws_bucket):
-    explainer_name = MODEL_INFO["explainer"]
-    explainer = load_shap_explainer(
-        session, aws_bucket,
-        posixpath.join('explainer', explainer_name),
-        os.path.join(tempfile.gettempdir(), explainer_name)
-    )
+    shap_values = explainer.shap_values(input_transformed)
 
-    best_pipeline         = load_pipeline(session, aws_bucket, 'sklearn-pipeline-deployment')
-    preprocessing_pipeline = Pipeline(steps=best_pipeline.steps[:-1])
-    input_df              = pd.DataFrame(input_df)
-    input_df_transformed  = preprocessing_pipeline.transform(input_df)
-
-    dataset_1     = dataset.iloc[:, 0:]
-    feature_names = dataset_1.columns
-    input_df_transformed = pd.DataFrame(input_df_transformed, columns=feature_names)
-
-    shap_values = explainer(input_df_transformed)
-
-    st.subheader("🔍 Decision Transparency (SHAP)")
+    st.subheader("Decision Transparency (SHAP)")
     fig, ax = plt.subplots(figsize=(10, 4))
-    shap.plots.waterfall(shap_values[0])
+    sv = shap_values[0]
+    order = np.argsort(np.abs(sv))[::-1][:10]
+    feats = [feature_names[i] for i in order]
+    vals  = sv[order]
+    colors = ["#dc2626" if v > 0 else "#16a34a" for v in vals]
+    ax.barh(feats[::-1], vals[::-1], color=colors[::-1], edgecolor='white')
+    ax.axvline(0, color='black', linewidth=0.8)
+    ax.set_xlabel("SHAP Value (impact on default probability)")
+    ax.set_title("Top 10 Feature Contributions", fontweight='bold')
+    from matplotlib.patches import Patch
+    ax.legend(handles=[Patch(color='#dc2626', label='Increases risk'),
+                       Patch(color='#16a34a', label='Decreases risk')],
+              loc='lower right', fontsize=8)
+    plt.tight_layout()
     st.pyplot(fig)
+    plt.close(fig)
 
-    top_feature = pd.Series(
-        shap_values[0].values, index=shap_values[0].feature_names
-    ).abs().idxmax()
-    st.info(f"**Business Insight:** The most influential factor in this decision was **{top_feature}**.")
-
+    top_feature = pd.Series(np.abs(sv), index=feature_names).idxmax()
+    st.info(f"**Business Insight:** The most influential factor in this prediction was **{top_feature}**.")
 
 # Streamlit UI
 st.set_page_config(page_title="Loan Default Predictor", page_icon="🏦", layout="wide")
 st.title("🏦 Loan Default Prediction")
+st.caption("Machine Learning in Finance - Milestone 4 | XGBoost Model | LendingClub Dataset")
 
 with st.form("pred_form"):
     st.subheader("Applicant Inputs")
@@ -149,7 +98,7 @@ with st.form("pred_form"):
     for i, inp in enumerate(MODEL_INFO["inputs"]):
         with cols[i % 2]:
             user_inputs[inp['name']] = st.number_input(
-                inp['name'].replace('_', ' ').upper(),
+                inp['label'],
                 min_value=float(inp['min']),
                 max_value=float(inp['max']),
                 value=float(inp['default']),
@@ -158,17 +107,21 @@ with st.form("pred_form"):
 
     submitted = st.form_submit_button("Run Prediction")
 
-original = dataset.iloc[0:1].to_dict()
-original.update(user_inputs)
+# Build full input row from X_train baseline + user inputs
+original = dataset.iloc[0:1].copy()
+for key, val in user_inputs.items():
+    if key in original.columns:
+        original[key] = val
+input_df = original[dataset.columns]
 
 if submitted:
-    res, status = call_model_api(original)
+    res, status = call_model(input_df)
     if status == 200:
-        if res == "Charged Off":
-            st.error(f"⚠️ Prediction: **{res}** — High Risk of Default")
+        if "High Risk" in res:
+            st.error(f"Prediction: **{res}**")
         else:
-            st.success(f"✅ Prediction: **{res}** — Low Risk")
+            st.success(f"Prediction: **{res}**")
         st.metric("Prediction Result", res)
-        display_explanation(original, session, aws_bucket)
+        display_explanation(input_df)
     else:
         st.error(res)
